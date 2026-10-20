@@ -167,6 +167,9 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
     ("btw", "platform.discord.command.btw.description",
      (("question", str, _REQUIRED, "platform.discord.command.btw.arg_question", None),),
      "/btw {question}", "platform.discord.command.btw.followup"),
+    # /discord-commands: template None -> registered by _register_discord_commands_slash
+    # (adapter-native, never reaches the LLM).
+    ("discord-commands", "platform.discord.command.discord_commands.description", (), None, None),
 )
 # Discord rejects the whole bulk sync (error 50035) when ONE description / parameter description /
 # Choice name exceeds 100 UTF-16 units, so every localized slot is cut at the cap.
@@ -4617,6 +4620,60 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             # defer() happens inside the handler *after* the auth gate.
             await self._handle_thread_create_slash(interaction, name, message, auto_archive_duration)
 
+    def _register_discord_commands_slash(self, tree, name: str, description: str) -> None:
+        """Register ``/discord-commands`` — an adapter-native inventory of the native command tree.
+
+        Adapter-native (not routed through the LLM): the answer is a static snapshot of the
+        registered command tree + the last sync outcome, so it must not cost a model turn.
+        """
+        @tree.command(name=name, description=description)
+        async def slash_discord_commands(interaction: discord.Interaction):
+            await self._handle_discord_commands_slash(interaction)
+
+    async def _handle_discord_commands_slash(self, interaction: discord.Interaction) -> None:
+        """Answer ``/discord-commands`` ephemerally with the command inventory + sync status."""
+        if not await self._check_slash_authorization(interaction, "/discord-commands"):
+            return
+        try:
+            cmds = sorted(self._client.tree.get_commands(), key=lambda c: c.name)
+            state = self._read_command_sync_state()
+            app_id = getattr(self._client, "application_id", None)
+            key = self._command_sync_state_key(app_id) if app_id else None
+            entry = state.get(key, {}) if key else {}
+            summary = entry.get("summary") or {}
+            lines = [
+                f"**Native Discord Slash Commands — {len(cmds)}/{_DISCORD_MAX_APP_COMMANDS}**",
+                f"Policy: `{self._get_discord_command_sync_policy()}`  •  Last sync: "
+                f"{entry.get('last_success_at', 'never')}",
+            ]
+            if summary:
+                lines.append(
+                    f"Sync summary: created={summary.get('created', 0)} updated={summary.get('updated', 0)} "
+                    f"recreated={summary.get('recreated', 0)} deleted={summary.get('deleted', 0)}"
+                )
+            lines.append("")
+            lines.append(" ".join(f"`/{c.name}`" for c in cmds))
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        except Exception as e:
+            logger.warning("[Discord] /discord-commands failed: %s", e, exc_info=True)
+            try:
+                await interaction.response.send_message(
+                    t("platform.discord.command.discord_commands.failed"), ephemeral=True,
+                )
+            except Exception:
+                pass
+
+    def _auto_register_commands_enabled(self) -> bool:
+        """Whether COMMAND_REGISTRY + plugin commands join the native Discord tree.
+
+        ``DISCORD_AUTO_REGISTER_COMMANDS=false`` keeps the tree to the curated native set
+        only — useful when the 100-command cap is tight or the auto-registered names are
+        noise. Native commands are unaffected: they always survive the cap.
+        """
+        return _scoped_gate_env("DISCORD_AUTO_REGISTER_COMMANDS", "true").lower() in {
+            "true", "1", "yes", "on",
+        }
+
     def _register_slash_commands(self) -> None:
         """Register Discord slash commands on the command tree."""
         if not self._client:
@@ -4624,13 +4681,19 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         tree = self._client.tree
         for name, description, args, template, followup in _native_slash_commands():
             if template is None:
-                self._register_thread_slash(tree, name, description)
+                # Adapter-native commands (no command-text template) register their own handler.
+                if name == "thread":
+                    self._register_thread_slash(tree, name, description)
+                elif name == "discord-commands":
+                    self._register_discord_commands_slash(tree, name, description)
                 continue
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
             )
         # Auto-register COMMAND_REGISTRY + plugin commands not yet on the tree. Native
         # commands above always survive the 100-command cap; reserve one slot for /skill.
+        # DISCORD_AUTO_REGISTER_COMMANDS=false keeps the tree to the curated native set only.
+        auto_register = self._auto_register_commands_enabled()
         already_registered: set[str] = set()
         slot_cap = _DISCORD_MAX_APP_COMMANDS - 1
         dropped_over_cap = 0
@@ -4668,20 +4731,36 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             except Exception:
                 pass
             config_overrides = _resolve_config_gates()
-            for cmd_def in COMMAND_REGISTRY:
-                if _is_gateway_available(cmd_def, config_overrides):
-                    _auto_register(cmd_def.name, cmd_def.description, cmd_def.args_hint)
-            logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
+            if not auto_register:
+                logger.info(
+                    "[%s] DISCORD_AUTO_REGISTER_COMMANDS=false — keeping the curated native "
+                    "command set only (%d commands)", self.name, len(already_registered),
+                )
+            else:
+                for cmd_def in COMMAND_REGISTRY:
+                    if _is_gateway_available(cmd_def, config_overrides):
+                        _auto_register(cmd_def.name, cmd_def.description, cmd_def.args_hint)
+                logger.debug("Discord auto-registered %d commands from COMMAND_REGISTRY", len(already_registered))
         except Exception as e:
             logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
         # Mirror PluginContext.register_command() commands into the native slash picker.
-        try:
-            from hermes_cli.commands import _iter_plugin_command_entries
-            for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
-                _auto_register(plugin_name, plugin_desc, plugin_args_hint)
-        except Exception as e:
-            logger.warning("Discord auto-register from plugin commands failed: %s", e)
+        if auto_register:
+            try:
+                from hermes_cli.commands import _iter_plugin_command_entries
+                for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
+                    _auto_register(plugin_name, plugin_desc, plugin_args_hint)
+            except Exception as e:
+                logger.warning("Discord auto-register from plugin commands failed: %s", e)
         self._register_skill_group(tree)
+        registered_total = len(tree.get_commands())
+        if registered_total >= _DISCORD_MAX_APP_COMMANDS * 0.9:
+            logger.warning(
+                "[%s] Discord slash commands at %d/%d (%.0f%%) — one over-limit command makes "
+                "Discord reject the ENTIRE sync (error 30032). Trim plugins or set "
+                "DISCORD_AUTO_REGISTER_COMMANDS=false to keep native commands only.",
+                self.name, registered_total, _DISCORD_MAX_APP_COMMANDS,
+                registered_total / _DISCORD_MAX_APP_COMMANDS * 100,
+            )
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
             logger.warning(

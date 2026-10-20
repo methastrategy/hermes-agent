@@ -1193,6 +1193,10 @@ platform:
         description: "Ask a side question about the current conversation"
         arg_question: "The side question to answer without interrupting"
         followup: "Side question dispatched~"
+      discord_commands:
+        description: "List native Discord slash commands and sync status"
+        followup: "Discord slash command inventory"
+        failed: "⚠️ Could not read the Discord slash command inventory."
       skill:
         description: "Run a Hermes skill"
         arg_name: "Which skill to run"
