@@ -644,3 +644,138 @@ def test_build_slash_event_routes_guild_profile_like_messages(adapter, monkeypat
     assert thread_event.source.guild_id == "1"
     assert thread_event.source.parent_chat_id == "100"
     assert thread_event.source.profile == "work"
+
+
+# ------------------------------------------------------------------
+# /discord-commands — adapter-native inventory of the native command tree
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_registers_native_discord_commands_slash(adapter):
+    """``/discord-commands`` must land on the tree as its own native command."""
+    adapter._register_slash_commands()
+
+    assert "discord-commands" in adapter._client.tree.commands
+
+
+@pytest.mark.asyncio
+async def test_discord_commands_closure_delegates_to_adapter_handler(adapter):
+    """The closure only forwards; the handler owns the auth gate and the response."""
+    adapter._handle_discord_commands_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["discord-commands"]
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await command(interaction)
+
+    adapter._handle_discord_commands_slash.assert_awaited_once_with(interaction)
+
+
+@pytest.mark.asyncio
+async def test_discord_commands_handler_reports_inventory_ephemerally(adapter):
+    """The reply lists the registered commands and the sync state, as an ephemeral message."""
+    adapter._client.tree.commands["help"] = SimpleNamespace(name="help", description="Show commands")
+    adapter._client.tree.commands["status"] = SimpleNamespace(name="status", description="Session info")
+    send_message = AsyncMock()
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=send_message))
+
+    await adapter._handle_discord_commands_slash(interaction)
+
+    send_message.assert_awaited_once()
+    kwargs = send_message.await_args.kwargs
+    assert kwargs["ephemeral"] is True
+    content = send_message.await_args.args[0]
+    assert "/help" in content
+    assert "/status" in content
+    assert "safe" in content  # default sync policy
+
+
+@pytest.mark.asyncio
+async def test_discord_commands_handler_rejects_unauthorized(adapter):
+    """An unauthorized user gets no inventory and no response body."""
+    adapter._check_slash_authorization = AsyncMock(return_value=False)
+    send_message = AsyncMock()
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=send_message))
+
+    await adapter._handle_discord_commands_slash(interaction)
+
+    send_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_discord_commands_handler_never_reaches_the_agent(adapter):
+    """Adapter-native: the command must not dispatch a message to the LLM."""
+    adapter.handle_message = AsyncMock()
+    adapter._client.tree.commands["help"] = SimpleNamespace(name="help", description="Show commands")
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._handle_discord_commands_slash(interaction)
+
+    adapter.handle_message.assert_not_awaited()
+
+
+# ------------------------------------------------------------------
+# DISCORD_AUTO_REGISTER_COMMANDS toggle
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_auto_register_disabled_keeps_only_curated_native_set(adapter):
+    """With the toggle off, COMMAND_REGISTRY commands must not join the tree."""
+    adapter._auto_register_commands_enabled = lambda: False
+    adapter._run_simple_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    names = set(adapter._client.tree.commands)
+    # Curated native commands are present.
+    assert "thread" in names
+    assert "discord-commands" in names
+    # Registry-driven commands are not.
+    assert "goal" not in names
+    assert "subgoal" not in names
+
+
+@pytest.mark.asyncio
+async def test_auto_register_enabled_keeps_registry_commands(adapter):
+    """The default (toggle on) still exposes COMMAND_REGISTRY commands natively."""
+    assert adapter._auto_register_commands_enabled() is True
+    adapter._run_simple_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    names = set(adapter._client.tree.commands)
+    assert "thread" in names
+    assert "discord-commands" in names
+    assert "goal" in names
+
+
+# ------------------------------------------------------------------
+# config.yaml -> env bridge for the slash-command surface knobs
+# ------------------------------------------------------------------
+
+
+def test_yaml_config_bridges_slash_command_knobs(monkeypatch):
+    """``discord:`` YAML keys become the DISCORD_* env vars the adapter reads."""
+    import os
+
+    from plugins.platforms.discord.adapter import _apply_yaml_config
+
+    for var in ("DISCORD_COMMAND_SYNC_POLICY", "DISCORD_AUTO_REGISTER_COMMANDS",
+                "DISCORD_HIDE_SLASH_COMMANDS"):
+        monkeypatch.delenv(var, raising=False)
+
+    extra = _apply_yaml_config({}, {
+        "command_sync_policy": "bulk",
+        "auto_register_commands": False,
+        "hide_slash_commands": True,
+    })
+
+    assert os.environ["DISCORD_COMMAND_SYNC_POLICY"] == "bulk"
+    # Booleans must land as the lowercase strings the adapter compares against.
+    assert os.environ["DISCORD_AUTO_REGISTER_COMMANDS"] == "false"
+    assert os.environ["DISCORD_HIDE_SLASH_COMMANDS"] == "true"
+    assert extra["command_sync_policy"] == "bulk"
+    assert extra["auto_register_commands"] is False

@@ -1554,6 +1554,13 @@ DEFAULT_CONFIG = {
         # require_mention); limit = max messages scanned.
         "history_backfill": True,
         "history_backfill_limit": 50,
+        # Native Discord slash-command surface. ``command_sync_policy``: safe | bulk | off.
+        # ``auto_register_commands``: false keeps only the curated built-in commands (the
+        # 100-command app cap rejects the ENTIRE sync when one command is over it).
+        # ``hide_slash_commands``: hide the commands from non-admins in Discord's picker.
+        "command_sync_policy": "safe",
+        "auto_register_commands": True,
+        "hide_slash_commands": False,
         # Replay messages missed while offline, after reconnect/startup.
         "missed_message_backfill": {
             "enabled": False,

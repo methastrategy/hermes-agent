@@ -311,6 +311,8 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_HOME_CHANNEL` | No | — | Channel ID where the bot sends proactive messages (cron output, reminders, notifications). |
 | `DISCORD_HOME_CHANNEL_NAME` | No | `"Home"` | Display name for the home channel in logs and status output. |
 | `DISCORD_COMMAND_SYNC_POLICY` | No | `"safe"` | Controls native slash-command startup sync. `"safe"` diffs existing global commands and only updates what changed, recreating commands when Discord metadata changes cannot be applied via patch. `"bulk"` preserves the old `tree.sync()` behavior. `"off"` skips startup sync entirely. |
+| `DISCORD_AUTO_REGISTER_COMMANDS` | No | `"true"` | When `false`, the native Discord command tree keeps only the curated built-in commands (`/new`, `/model`, `/status`, `/help`, …) and skips the auto-registration of every `COMMAND_REGISTRY` and plugin command. Useful when the tree approaches Discord's 100-command application cap — one command over the cap makes Discord reject the **entire** sync. |
+| `DISCORD_HIDE_SLASH_COMMANDS` | No | `"false"` | When `true`, Discord hides every native slash command from non-administrators (via `default_member_permissions=0`). The real gate stays `_check_slash_authorization`; this is defense in depth for the slash-command picker. |
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
 | `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
@@ -713,6 +715,23 @@ Hermes automatically registers installed skills as **native Discord Application 
 - Skills are registered during bot startup alongside built-in commands like `/model`, `/reset`, and `/bg`
 
 No extra configuration is needed — any skill installed via `hermes skills install` is automatically registered as a Discord slash command on the next gateway restart.
+
+### Inspecting the Command Tree
+
+`/discord-commands` returns an ephemeral inventory of the native command tree: every registered command name, how many slots are used against Discord's 100-command cap, the active sync policy, and the outcome of the last sync. It is answered by the adapter itself, so it costs no model turn.
+
+Use it when commands you expect are missing from the `/` menu — the reply shows whether they were registered but dropped over the cap, or never synced at all.
+
+### Trimming the Command Tree
+
+Discord caps an application at **100** global slash commands, and a single command over the cap makes Discord reject the **entire** sync (error 30032) — not just the overflow command. When the tree gets close, keep only the curated built-in commands and drop the auto-registered registry/plugin/skill commands:
+
+```yaml
+discord:
+  auto_register_commands: false   # default: true
+```
+
+The built-in commands (`/new`, `/model`, `/status`, `/help`, `/skill`, …) always survive the cap; only the auto-registered ones are dropped. `command_sync_policy` and `hide_slash_commands` are configurable the same way.
 
 ### Disabling Slash Command Registration
 

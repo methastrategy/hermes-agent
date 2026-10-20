@@ -7480,6 +7480,19 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _discord_rtm = discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg else _discord_extra.get("reply_to_mode")
     if _discord_rtm is not None:
         _env_default("DISCORD_REPLY_TO_MODE", "off" if _discord_rtm is False else str(_discord_rtm).lower())
+    # Slash-command surface knobs: how aggressively the native Discord command tree is
+    # synced, and whether COMMAND_REGISTRY/plugin commands join it at all.
+    for yaml_key, env_key in (
+        ("command_sync_policy", "DISCORD_COMMAND_SYNC_POLICY"),
+        ("auto_register_commands", "DISCORD_AUTO_REGISTER_COMMANDS"),
+        ("hide_slash_commands", "DISCORD_HIDE_SLASH_COMMANDS"),
+    ):
+        value = discord_cfg.get(yaml_key)
+        if value is None:
+            value = _discord_extra.get(yaml_key)
+        if value is not None:
+            seeded_extra[yaml_key] = value
+            _env_default(env_key, str(value).lower() if isinstance(value, bool) else str(value))
     # Public config keys win over the generic ``extra`` form.
     _websocket_liveness_cfg = {**_discord_extra, **discord_cfg}
     # WebSocket health knobs (REST 200 is not Gateway health); legacy liveness_* aliases accepted.
