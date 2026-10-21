@@ -313,6 +313,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_COMMAND_SYNC_POLICY` | No | `"safe"` | Controls native slash-command startup sync. `"safe"` diffs existing global commands and only updates what changed, recreating commands when Discord metadata changes cannot be applied via patch. `"bulk"` preserves the old `tree.sync()` behavior. `"off"` skips startup sync entirely. |
 | `DISCORD_AUTO_REGISTER_COMMANDS` | No | `"true"` | When `false`, the native Discord command tree keeps only the curated built-in commands (`/new`, `/model`, `/status`, `/help`, …) and skips the auto-registration of every `COMMAND_REGISTRY` and plugin command. Useful when the tree approaches Discord's 100-command application cap — one command over the cap makes Discord reject the **entire** sync. |
 | `DISCORD_HIDE_SLASH_COMMANDS` | No | `"false"` | When `true`, Discord hides every native slash command from non-administrators (via `default_member_permissions=0`). The real gate stays `_check_slash_authorization`; this is defense in depth for the slash-command picker. |
+| `discord.guild_id` | No | — | Guild ID to sync the native slash-command tree into **instead of globally**. Guild-scoped commands appear **instantly**; global commands are cached by Discord for up to an hour. Leave unset for the global behavior. |
 | `DISCORD_REQUIRE_MENTION` | No | `true` | When `true`, the bot only responds in server channels when `@mentioned`. Set to `false` to respond to all messages in every channel. |
 | `DISCORD_THREAD_REQUIRE_MENTION` | No | `false` | When `true`, the in-thread mention shortcut is disabled — threads are gated the same as channels, requiring `@mention` even after the bot has already participated. Use this when multiple bots share a thread and you want each to fire only on explicit `@mention`. |
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
@@ -732,6 +733,23 @@ discord:
 ```
 
 The built-in commands (`/new`, `/model`, `/status`, `/help`, `/skill`, …) always survive the cap; only the auto-registered ones are dropped. `command_sync_policy` and `hide_slash_commands` are configurable the same way.
+
+### Instant Guild-Scoped Commands
+
+Global application commands are cached by Discord for up to an hour, so a newly registered command can take a long time to appear in the `/` menu. Point Hermes at a guild and the commands are registered **for that guild only** — they show up immediately:
+
+```yaml
+discord:
+  guild_id: "1513267564422365264"
+```
+
+The bot must be in the guild with the `applications.commands` scope (the standard invite URL already requests it). Guild-scoped commands are invisible outside that guild, and the global set is left untouched — this is an **alternative** to the global sync, not an addition. `/discord-commands` reports the active scope.
+
+### `/agy` — Antigravity Skills
+
+`/agy <skill> <prompt>` runs one of the Antigravity bundle's skills. The `skill` argument autocompletes from the installed bundle (`architect`, `debug`, `quant`, `mql5-ea`, …), so you pick from a list on mobile instead of typing a slug.
+
+`/agy` runs the **skill**, not a core Hermes command, even for names that collide — `/agy debug` runs the Antigravity `debug` skill, while the bare `/debug` stays the core command. `/skill` remains the general-purpose picker for every installed skill.
 
 ### Disabling Slash Command Registration
 
