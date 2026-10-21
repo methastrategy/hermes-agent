@@ -816,6 +816,77 @@ def test_guild_id_bridges_from_yaml(monkeypatch):
     assert extra["guild_id"] == "1513267564422365264"
 
 
+def _sync_adapter(guild_id, existing_commands):
+    """An adapter whose tree and HTTP layer are mocked for a sync diff."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True, token="***", extra={"guild_id": guild_id} if guild_id else {},
+    ))
+    http = MagicMock()
+    for name in ("upsert_guild_command", "delete_guild_command", "edit_guild_command",
+                 "upsert_global_command", "delete_global_command", "edit_global_command"):
+        setattr(http, name, AsyncMock())
+    tree = MagicMock()
+    tree.get_commands.return_value = [
+        SimpleNamespace(to_dict=lambda t: {"type": 1, "name": "help", "description": "NEW"}),
+    ]
+    tree.fetch_commands = AsyncMock(return_value=existing_commands)
+    adapter._client = SimpleNamespace(tree=tree, http=http, application_id="app123")
+    return adapter, http, tree
+
+
+@pytest.mark.asyncio
+async def test_guild_scoped_sync_uses_guild_endpoints():
+    """With a guild configured, the sync hits the GUILD endpoints, never the global ones."""
+    from types import SimpleNamespace
+
+    existing = [SimpleNamespace(id=42, name="help", type=1,
+                                to_dict=lambda: {"type": 1, "name": "help", "description": "OLD"})]
+    adapter, http, tree = _sync_adapter("1513267564422365264", existing)
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary["updated"] == 1
+    http.edit_guild_command.assert_awaited_once()
+    http.edit_global_command.assert_not_awaited()
+    http.upsert_global_command.assert_not_awaited()
+    # The guild id reaches both the fetch and the mutation.
+    assert tree.fetch_commands.await_args.kwargs["guild"].id == 1513267564422365264
+    assert str(http.edit_guild_command.await_args.args[1]) == "1513267564422365264"
+
+
+@pytest.mark.asyncio
+async def test_global_sync_still_uses_global_endpoints():
+    """Without a guild configured, the sync is unchanged: global endpoints, no guild kwarg."""
+    from types import SimpleNamespace
+
+    existing = [SimpleNamespace(id=42, name="help", type=1,
+                                to_dict=lambda: {"type": 1, "name": "help", "description": "OLD"})]
+    adapter, http, tree = _sync_adapter(None, existing)
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary["updated"] == 1
+    http.edit_global_command.assert_awaited_once()
+    http.edit_guild_command.assert_not_awaited()
+    assert tree.fetch_commands.await_args.kwargs.get("guild") is None
+
+
+@pytest.mark.asyncio
+async def test_guild_scoped_sync_creates_with_upsert_guild_command():
+    """A command that does not exist yet is created through the guild endpoint."""
+    adapter, http, _tree = _sync_adapter("1513267564422365264", [])
+
+    summary = await adapter._safe_sync_slash_commands()
+
+    assert summary["created"] == 1
+    http.upsert_guild_command.assert_awaited_once()
+    http.upsert_global_command.assert_not_awaited()
+    assert str(http.upsert_guild_command.await_args.args[1]) == "1513267564422365264"
+
+
 # ------------------------------------------------------------------
 # /agy — Antigravity skills with autocomplete
 # ------------------------------------------------------------------
