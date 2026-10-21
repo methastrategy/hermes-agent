@@ -726,6 +726,28 @@ def build_skill_invocation_message(
     return _render_skill_block(loaded, note, task_id, user_instruction=user_instruction, runtime_note=runtime_note)
 
 
+def build_skill_message_by_identifier(
+    skill_identifier: str, user_instruction: str = "", task_id: str | None = None,
+) -> Optional[str]:
+    """Build the skill invocation message for a skill identified by NAME or PATH.
+
+    ``skill_identifier`` accepts the same spellings ``skill_view`` does: a bare
+    name (``debug``) or a path relative to the skills root
+    (``antigravity_skills/debug``). The path form is the one that disambiguates:
+    a bare name can be ambiguous (two skills share it) and a skill whose slug
+    collides with a core Hermes command (``/debug``) is absent from the slash
+    map entirely, so only the path reaches it.
+
+    Returns None when the skill cannot be loaded.
+    """
+    loaded = _load_skill_payload(skill_identifier, task_id=task_id)
+    if not loaded:
+        return None
+    note = (f'[IMPORTANT: The user has invoked the "{loaded[2]}" skill, indicating they want '
+            "you to follow its instructions. The full skill content is loaded below.]")
+    return _render_skill_block(loaded, note, task_id, user_instruction=user_instruction)
+
+
 # Stacked slash-skill invocations — `/skill-a /skill-b do XYZ` loads every
 # leading skill (up to _MAX_STACKED_SKILLS). The message reuses the BUNDLE
 # scaffolding markers so the memory extractor needs no new plumbing.

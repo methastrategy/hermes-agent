@@ -1202,6 +1202,12 @@ platform:
         arg_name: "Which skill to run"
         arg_args: "Optional arguments for the skill"
         unknown: "Unknown skill: `{name}`. Start typing for autocomplete suggestions."
+      agy:
+        description: "Run an Antigravity skill"
+        arg_skill: "Which skill to run (type to search)"
+        arg_prompt: "The task for the skill"
+        unknown: "Unknown skill: `{name}`. Type to search the available skills."
+        load_failed: "⚠️ Could not load the skill `{name}`."
       auto_args_description: "Arguments: {args_hint}"
       auto_description_fallback: "Run /{name}"
     limits:

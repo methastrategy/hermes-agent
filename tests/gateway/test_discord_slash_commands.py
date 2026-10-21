@@ -779,3 +779,164 @@ def test_yaml_config_bridges_slash_command_knobs(monkeypatch):
     assert os.environ["DISCORD_HIDE_SLASH_COMMANDS"] == "true"
     assert extra["command_sync_policy"] == "bulk"
     assert extra["auto_register_commands"] is False
+
+
+# ------------------------------------------------------------------
+# discord.guild_id — guild-scoped (instant) command sync
+# ------------------------------------------------------------------
+
+
+def test_guild_id_selects_guild_scoped_sync(adapter):
+    """``discord.guild_id`` selects guild-scoped sync; empty = global."""
+    assert adapter._get_discord_sync_guild_id() is None
+    adapter.config.extra["guild_id"] = "1513267564422365264"
+    assert adapter._get_discord_sync_guild_id() == "1513267564422365264"
+
+
+def test_guild_id_rejects_non_snowflake(adapter):
+    """A non-numeric guild id falls back to the global sync instead of crashing."""
+    adapter.config.extra["guild_id"] = "not-a-snowflake"
+    assert adapter._get_discord_sync_guild_id() is None
+
+
+def test_sync_state_key_separates_global_and_guild(adapter):
+    """A guild sync must not share the global sync's state slot (nor its fingerprint)."""
+    global_key = adapter._command_sync_state_key("app123")
+    adapter.config.extra["guild_id"] = "1513267564422365264"
+    guild_key = adapter._command_sync_state_key("app123")
+    assert global_key != guild_key
+    assert "guild" in guild_key
+
+
+def test_guild_id_bridges_from_yaml(monkeypatch):
+    """``discord.guild_id`` reaches the adapter's extra block (an ID, not a flag)."""
+    from plugins.platforms.discord.adapter import _apply_yaml_config
+
+    extra = _apply_yaml_config({}, {"guild_id": "1513267564422365264"})
+    assert extra["guild_id"] == "1513267564422365264"
+
+
+# ------------------------------------------------------------------
+# /agy — Antigravity skills with autocomplete
+# ------------------------------------------------------------------
+
+
+def _seed_agy(adapter, entries=None):
+    """Seed the /agy catalog without touching disk.
+
+    ``_register_agy_slash`` clears the catalog before scanning, so a stubbed
+    scan has to REPOPULATE it — a no-op stub would leave the catalog empty and
+    the command unregistered.
+    """
+    entries = list(entries or [("architect", "design systems", "antigravity_skills/architect")])
+
+    def _fake_refresh():
+        adapter._agy_entries = list(entries)
+        adapter._agy_lookup = {n: (d, i) for n, d, i in entries}
+
+    adapter._refresh_agy_catalog_state = _fake_refresh
+    _fake_refresh()
+    return entries
+
+
+@pytest.mark.asyncio
+async def test_registers_agy_slash_command(adapter):
+    """``/agy`` lands on the tree as its own native command."""
+    _seed_agy(adapter)
+
+    adapter._register_agy_slash(adapter._client.tree)
+
+    assert "agy" in adapter._client.tree.commands
+
+
+@pytest.mark.asyncio
+async def test_agy_catalog_scans_the_bundle(adapter, tmp_path, monkeypatch):
+    """The catalog is scanned from disk, so slug-colliding skills are still offered."""
+    from tools import skills_tool
+
+    # A temp bundle: the test sandbox isolates HERMES_HOME, so the real skills
+    # dir is not readable from a test.
+    bundle = tmp_path / "antigravity_skills"
+    for name in ("architect", "debug", "review", "medesign"):
+        skill_dir = bundle / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: The {name} skill\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path)
+
+    adapter._refresh_agy_catalog_state()
+
+    names = {n for n, _d, _i in adapter._agy_entries}
+    # Every bundle skill is offered, including the ones whose slug collides with
+    # a core Hermes command (/debug, /review) — /agy runs the SKILL, not the
+    # core command.
+    assert names == {"architect", "debug", "review", "medesign"}
+    # Every entry carries a path-qualified identifier so the loader can reach it.
+    for _n, _d, identifier in adapter._agy_entries:
+        assert identifier.startswith("antigravity_skills/")
+
+
+@pytest.mark.asyncio
+async def test_agy_catalog_is_empty_without_a_bundle(adapter, tmp_path, monkeypatch):
+    """No bundle directory means no /agy entries (the command is not registered)."""
+    from tools import skills_tool
+
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", tmp_path / "empty")
+
+    adapter._refresh_agy_catalog_state()
+
+    assert adapter._agy_entries == []
+
+
+@pytest.mark.asyncio
+async def test_agy_handler_rejects_unauthorized(adapter):
+    """An unauthorized user gets no skill run and no catalog leak."""
+    adapter._check_slash_authorization = AsyncMock(return_value=False)
+    adapter._run_agy_skill = AsyncMock()
+    _seed_agy(adapter)
+
+    adapter._register_agy_slash(adapter._client.tree)
+    # add_command() stores a Command object; the callback is what runs.
+    command = adapter._client.tree.commands["agy"].callback
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await command(interaction, skill="architect", prompt="design a thing")
+
+    adapter._run_agy_skill.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agy_handler_dispatches_the_selected_skill(adapter):
+    """The selected skill is resolved to its identifier and run."""
+    adapter._run_agy_skill = AsyncMock()
+    _seed_agy(adapter)
+
+    adapter._register_agy_slash(adapter._client.tree)
+    command = adapter._client.tree.commands["agy"].callback
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await command(interaction, skill="architect", prompt="design a thing")
+
+    adapter._run_agy_skill.assert_awaited_once_with(
+        interaction, "antigravity_skills/architect", "design a thing",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agy_handler_rejects_unknown_skill(adapter):
+    """An unknown skill name gets an ephemeral notice and runs nothing."""
+    adapter._run_agy_skill = AsyncMock()
+    _seed_agy(adapter)
+
+    adapter._register_agy_slash(adapter._client.tree)
+    command = adapter._client.tree.commands["agy"].callback
+    send_message = AsyncMock()
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=send_message))
+
+    await command(interaction, skill="nope", prompt="x")
+
+    adapter._run_agy_skill.assert_not_awaited()
+    send_message.assert_awaited_once()
+    assert send_message.await_args.kwargs["ephemeral"] is True

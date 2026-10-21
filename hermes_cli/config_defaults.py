@@ -1561,6 +1561,10 @@ DEFAULT_CONFIG = {
         "command_sync_policy": "safe",
         "auto_register_commands": True,
         "hide_slash_commands": False,
+        # Sync the native slash-command tree to THIS GUILD instead of globally.
+        # Guild-scoped commands appear instantly; global ones are cached by Discord
+        # for up to an hour. Leave empty for the global behavior.
+        "guild_id": "",
         # Replay messages missed while offline, after reconnect/startup.
         "missed_message_backfill": {
             "enabled": False,

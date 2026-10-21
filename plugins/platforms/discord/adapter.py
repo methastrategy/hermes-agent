@@ -174,6 +174,10 @@ _NATIVE_SLASH_COMMAND_SPECS: tuple = (
 # Discord rejects the whole bulk sync (error 50035) when ONE description / parameter description /
 # Choice name exceeds 100 UTF-16 units, so every localized slot is cut at the cap.
 _DISCORD_APP_COMMAND_TEXT_LIMIT = 100
+# The skill bundle /agy offers: a directory under the skills root, scanned from
+# disk. A curated bundle keeps the autocomplete inside Discord's 25-choice cap
+# and gives the bundle's own skills a distinct, unambiguous entry point.
+_AGY_SKILL_CATEGORY = "antigravity_skills"
 
 
 def _default_voice_ack_phrases() -> list:
@@ -2258,6 +2262,15 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         )
 
     def _command_sync_state_key(self, app_id: Any) -> str:
+        """State slot for one (app, scope) pair.
+
+        A guild-scoped sync and the global sync are different command sets, so
+        they must not share a state entry (nor a fingerprint) — otherwise one
+        suppresses the other.
+        """
+        guild_id = self._get_discord_sync_guild_id()
+        if guild_id:
+            return f"{app_id or 'unknown'}:guild:{guild_id}"
         return str(app_id or "unknown")
 
     def _desired_command_sync_fingerprint(self) -> str:
@@ -2271,7 +2284,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         desired.sort(key=lambda item: (item.get("type", 1), item.get("name", "")))
         # Descriptions are baked into Discord at sync time, so the language is part of the identity:
         # a display.language change must re-sync even if the texts happened to be identical.
-        payload = json.dumps({"language": get_language(), "commands": desired}, sort_keys=True, separators=(",", ":"))
+        # The scope (global vs one guild) is part of it too — the two sync different command sets.
+        payload = json.dumps({
+            "language": get_language(),
+            "scope": self._get_discord_sync_guild_id() or "global",
+            "commands": desired,
+        }, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _command_sync_skip_reason(self, app_id: Any, fingerprint: str) -> Optional[str]:
@@ -2405,8 +2423,19 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             if sync_policy == "off":
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
                 return
+            guild_id = self._get_discord_sync_guild_id()
+            if guild_id:
+                logger.info(
+                    "[%s] Syncing slash commands to guild %s (guild-scoped = instant propagation; "
+                    "the global command set is left untouched)",
+                    self.name, guild_id,
+                )
             if sync_policy == "bulk":
-                synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
+                if guild_id:
+                    synced = await asyncio.wait_for(
+                        self._client.tree.sync(guild=_Snowflake(int(guild_id))), timeout=30)
+                else:
+                    synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
                 logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
                 return
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
@@ -3054,6 +3083,27 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             )
         return "safe"
 
+    def _get_discord_sync_guild_id(self) -> Optional[str]:
+        """Guild to sync the native command tree into (None = global).
+
+        Guild-scoped commands appear INSTANTLY; global commands are cached by
+        Discord for up to an hour. Configured via ``discord.guild_id``. This is
+        an alternative to the global sync, not an addition: a guild-scoped
+        command is invisible outside that guild.
+        """
+        extra = getattr(self.config, "extra", None) if self.config else None
+        raw = (extra or {}).get("guild_id") if isinstance(extra, dict) else None
+        raw = str(raw or "").strip()
+        if not raw:
+            return None
+        if not raw.isdigit():
+            logger.warning(
+                "[%s] Invalid discord.guild_id=%r (not a snowflake) — using global sync",
+                self.name, raw,
+            )
+            return None
+        return raw
+
     def _canonicalize_app_command_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Reduce command payloads to the semantic fields Hermes manages."""
         contexts = payload.get("contexts")
@@ -3137,7 +3187,12 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         }
 
     async def _safe_sync_slash_commands(self) -> dict[str, int]:
-        """Diff existing global commands and only mutate the commands that changed."""
+        """Diff existing commands and only mutate the commands that changed.
+
+        Guild-scoped when ``discord.guild_id`` is set (commands appear
+        instantly); global otherwise. Same diff algorithm for both — only the
+        fetch and the four HTTP calls differ.
+        """
         summary = {"total": 0, "unchanged": 0, "updated": 0, "recreated": 0, "created": 0, "deleted": 0}
         if not self._client:
             return summary
@@ -3145,12 +3200,17 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
         if not app_id:
             raise RuntimeError("Discord application ID is unavailable for slash command sync")
+        guild_id = self._get_discord_sync_guild_id()
         desired_payloads = [command.to_dict(tree) for command in tree.get_commands()]
         desired_by_key = {
             (int(payload.get("type", 1) or 1), str(payload.get("name", "") or "").lower()): payload
             for payload in desired_payloads
         }
-        existing_commands = await tree.fetch_commands()
+        if guild_id:
+            # _Snowflake, not discord.Object: stubbed discord test doubles cannot build the latter.
+            existing_commands = await tree.fetch_commands(guild=_Snowflake(int(guild_id)))
+        else:
+            existing_commands = await tree.fetch_commands()
         existing_by_key = {
             (
                 int(getattr(getattr(command, "type", None), "value", getattr(command, "type", 1)) or 1),
@@ -3173,12 +3233,18 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         obsolete_keys = set(existing_by_key.keys()) - set(desired_by_key.keys())
         for key in obsolete_keys:
             current = existing_by_key.pop(key)
-            await mutate(http.delete_global_command, app_id, current.id)
+            if guild_id:
+                await mutate(http.delete_guild_command, app_id, int(guild_id), current.id)
+            else:
+                await mutate(http.delete_global_command, app_id, current.id)
             summary["deleted"] += 1
         for key, desired in desired_by_key.items():
             current = existing_by_key.pop(key, None)
             if current is None:
-                await mutate(http.upsert_global_command, app_id, desired)
+                if guild_id:
+                    await mutate(http.upsert_guild_command, app_id, int(guild_id), desired)
+                else:
+                    await mutate(http.upsert_global_command, app_id, desired)
                 summary["created"] += 1
                 continue
             current_existing_payload = self._existing_command_to_payload(current)
@@ -3197,10 +3263,16 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 # obsolete-path delete-first below is different: an upsert
                 # pushing the live total over 100 fails with 30032 (breaks ALL
                 # slash commands), so an app at the cap must shrink first.
-                await mutate(http.upsert_global_command, app_id, desired)
+                if guild_id:
+                    await mutate(http.upsert_guild_command, app_id, int(guild_id), desired)
+                else:
+                    await mutate(http.upsert_global_command, app_id, desired)
                 summary["recreated"] += 1
                 continue
-            await mutate(http.edit_global_command, app_id, current.id, desired)
+            if guild_id:
+                await mutate(http.edit_guild_command, app_id, int(guild_id), current.id, desired)
+            else:
+                await mutate(http.edit_global_command, app_id, current.id, desired)
             summary["updated"] += 1
         summary["total"] = len(desired_payloads)
         return summary
@@ -4646,6 +4718,9 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
                 f"Policy: `{self._get_discord_command_sync_policy()}`  •  Last sync: "
                 f"{entry.get('last_success_at', 'never')}",
             ]
+            guild_id = self._get_discord_sync_guild_id()
+            if guild_id:
+                lines.append(f"Scope: **guild {guild_id}** (instant propagation)")
             if summary:
                 lines.append(
                     f"Sync summary: created={summary.get('created', 0)} updated={summary.get('updated', 0)} "
@@ -4752,6 +4827,7 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             except Exception as e:
                 logger.warning("Discord auto-register from plugin commands failed: %s", e)
         self._register_skill_group(tree)
+        self._register_agy_slash(tree)
         registered_total = len(tree.get_commands())
         if registered_total >= _DISCORD_MAX_APP_COMMANDS * 0.9:
             logger.warning(
@@ -4885,6 +4961,166 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         except Exception as exc:
             logger.warning("[%s] Failed to register /skill command: %s", self.name, exc)
 
+    def _register_agy_slash(self, tree) -> None:
+        """Register ``/agy <skill> <prompt>`` — a curated, mobile-friendly skill picker.
+
+        Flat two-argument command, not a nested group: the nested layout blew
+        Discord's ~8000-byte payload cap and broke ``tree.sync()`` (see
+        ``_register_skill_group``). The skill list is fetched dynamically through
+        autocomplete, so the payload stays constant-size no matter how many
+        skills the bundle holds.
+        """
+        try:
+            existing_names = set()
+            try:
+                existing_names = {cmd.name for cmd in tree.get_commands()}
+            except Exception:
+                pass
+            if "agy" in existing_names:
+                return
+            # Instance-level state so the callbacks always read the freshest entries.
+            self._agy_entries: list[tuple[str, str, str]] = []
+            self._agy_lookup: dict[str, tuple[str, str]] = {}
+            self._refresh_agy_catalog_state()
+            if not self._agy_entries:
+                logger.info("[%s] /agy not registered — no %s skills found", self.name, _AGY_SKILL_CATEGORY)
+                return
+
+            async def _autocomplete_skill(interaction: discord.Interaction, current: str) -> list:
+                """Filter the bundle's skills by typed prefix (Discord caps at 25).
+
+                Unauthorized users get ``[]``: no catalog leak, no per-keystroke
+                ephemeral rejections.
+                """
+                try:
+                    allowed, _reason = self._evaluate_slash_authorization(interaction)
+                except Exception:
+                    # Never raise from autocomplete; fail closed.
+                    return []
+                if not allowed:
+                    return []
+                q = (current or "").strip().lower()
+                choices: list = []
+                for name, desc, _identifier in self._agy_entries:
+                    if not q or q in name.lower() or (desc and q in desc.lower()):
+                        label = f"{name} — {desc}" if desc else name
+                        # Discord's Choice.name is capped at 100 chars.
+                        if len(label) > 100:
+                            label = label[:97] + "..."
+                        choices.append(discord.app_commands.Choice(name=label, value=name))
+                        if len(choices) >= 25:
+                            break
+                return choices
+
+            @discord.app_commands.describe(
+                skill=_t_discord("platform.discord.command.agy.arg_skill", _DISCORD_APP_COMMAND_TEXT_LIMIT),
+                prompt=_t_discord("platform.discord.command.agy.arg_prompt", _DISCORD_APP_COMMAND_TEXT_LIMIT),
+            )
+            @discord.app_commands.autocomplete(skill=_autocomplete_skill)
+            async def _agy_handler(interaction: discord.Interaction, skill: str, prompt: str = ""):
+                # Authorize BEFORE lookup so unknown/known names reject identically
+                # (no catalog probing).
+                if not await self._check_slash_authorization(interaction, "/agy"):
+                    return
+                entry = self._agy_lookup.get(skill)
+                if not entry:
+                    await interaction.response.send_message(
+                        t("platform.discord.command.agy.unknown", name=skill), ephemeral=True)
+                    return
+                _desc, identifier = entry
+                await self._run_agy_skill(interaction, identifier, prompt)
+
+            cmd = discord.app_commands.Command(
+                name="agy",
+                description=_t_discord("platform.discord.command.agy.description", _DISCORD_APP_COMMAND_TEXT_LIMIT),
+                callback=_agy_handler,
+            )
+            tree.add_command(cmd)
+            logger.info(
+                "[%s] Registered /agy command with %d %s skill(s)",
+                self.name, len(self._agy_entries), _AGY_SKILL_CATEGORY,
+            )
+        except Exception as exc:
+            logger.warning("[%s] Failed to register /agy command: %s", self.name, exc)
+
+    async def _run_agy_skill(self, interaction: discord.Interaction, identifier: str, prompt: str) -> None:
+        """Load the skill and hand its content to the agent as a normal turn.
+
+        The skill message is built here (not routed as a slash command) so the
+        chosen skill runs even when its slug collides with a core Hermes
+        command: ``/agy debug`` must run the Antigravity debug skill, not the
+        core ``/debug`` command.
+        """
+        from agent.skill_commands import build_skill_message_by_identifier
+        try:
+            message = await asyncio.to_thread(
+                build_skill_message_by_identifier, identifier, prompt)
+        except Exception as exc:
+            logger.warning("[%s] /agy could not load skill %r: %s", self.name, identifier, exc)
+            message = None
+        if not message:
+            try:
+                await interaction.response.send_message(
+                    t("platform.discord.command.agy.load_failed", name=identifier), ephemeral=True)
+            except Exception:
+                pass
+            return
+        # Deliver as a plain message (not a slash command) so the gateway runs
+        # it as a normal turn with the skill content prepended.
+        event = self._build_slash_event(interaction, message)
+        event.message_type = MessageType.TEXT
+        await self.handle_message(event)
+
+    def _refresh_agy_catalog_state(self) -> None:
+        """Re-scan the Antigravity bundle and repopulate the ``/agy`` catalog in place.
+
+        The bundle is scanned from DISK rather than taken from the slash-command
+        map, so a skill whose slug collides with a core Hermes command
+        (``debug``, ``handoff``, ``review``) is still offered — the user's
+        explicit choice is the Antigravity skill, not the core command. Entries
+        are ``(name, description, identifier)`` where *identifier* is the
+        path-qualified ``<category>/<skill>`` form that resolves unambiguously
+        (a bare name can match two skills, e.g. ``medesign``).
+
+        No Discord API calls: the autocomplete callback and the handler read
+        these attributes directly.
+        """
+        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter
+        entries: list[tuple[str, str, str]] = []
+        seen: set[str] = set()
+        try:
+            bundle_root = SKILLS_DIR / _AGY_SKILL_CATEGORY
+            for skill_md in sorted(bundle_root.glob("*/SKILL.md")):
+                skill_name = skill_md.parent.name
+                if skill_name in seen:
+                    continue
+                try:
+                    frontmatter, body = _parse_frontmatter(
+                        skill_md.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    continue
+                display = str(frontmatter.get("name") or skill_name).strip() or skill_name
+                if display in seen:
+                    continue
+                desc = str(frontmatter.get("description") or "").strip()
+                if not desc:
+                    desc = next(
+                        (line.strip()[:80] for line in body.strip().split("\n")
+                         if line.strip() and not line.strip().startswith("#")),
+                        "",
+                    )
+                seen.add(display)
+                # The path-qualified identifier is what reaches the skill: it
+                # bypasses the core-command slug collision AND the same-name
+                # ambiguity (medesign exists twice in the catalog).
+                identifier = f"{_AGY_SKILL_CATEGORY}/{skill_name}"
+                entries.append((display, desc[:100], identifier))
+        except Exception as exc:
+            logger.warning("[%s] /agy catalog scan failed: %s", self.name, exc)
+        entries.sort(key=lambda t: t[0])
+        self._agy_entries = entries
+        self._agy_lookup = {n: (d, i) for n, d, i in entries}
+
     def _refresh_skill_catalog_state(self) -> None:
         """Re-scan disk and repopulate ``self._skill_entries``/``_skill_lookup`` in place.
         No Discord API calls: autocomplete and handler read these attributes directly."""
@@ -4907,6 +5143,8 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         Called after ``reload_skills``; no ``tree.sync()`` since autocomplete options are dynamic."""
         try:
             await asyncio.to_thread(self._refresh_skill_catalog_state)
+            # /agy reads its own bundle catalog; refresh it in the same pass.
+            await asyncio.to_thread(self._refresh_agy_catalog_state)
         except Exception as exc:
             logger.warning(
                 "[%s] Failed to refresh /skill autocomplete after reload: %s", self.name, exc,
@@ -4915,6 +5153,10 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         logger.info(
             "[%s] Refreshed /skill autocomplete: %d skill(s) available (%d filtered)", self.name,
             len(self._skill_entries), self._skill_group_hidden_count,
+        )
+        logger.info(
+            "[%s] Refreshed /agy autocomplete: %d %s skill(s)", self.name,
+            len(getattr(self, "_agy_entries", [])), _AGY_SKILL_CATEGORY,
         )
         return (len(self._skill_entries), self._skill_group_hidden_count)
 
@@ -7493,6 +7735,12 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         if value is not None:
             seeded_extra[yaml_key] = value
             _env_default(env_key, str(value).lower() if isinstance(value, bool) else str(value))
+    # Guild-scoped command sync: a snowflake ID, not a flag — never lowercased.
+    # Setting it makes the native command tree guild-scoped (instant propagation)
+    # INSTEAD of global, so the two are alternatives, not additive.
+    _discord_guild_id = discord_cfg.get("guild_id") or _discord_extra.get("guild_id")
+    if _discord_guild_id:
+        seeded_extra["guild_id"] = str(_discord_guild_id).strip()
     # Public config keys win over the generic ``extra`` form.
     _websocket_liveness_cfg = {**_discord_extra, **discord_cfg}
     # WebSocket health knobs (REST 200 is not Gateway health); legacy liveness_* aliases accepted.
