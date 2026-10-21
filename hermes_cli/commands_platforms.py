@@ -6,7 +6,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Optional
 
 from agent.i18n import t
 from hermes_cli.commands import (
@@ -192,6 +192,15 @@ def _iter_gateway_skills(platform: str):
     path component (``/my-skills`` never admits ``/my-skills-extra``). ``rel_parts`` is the skill
     dir relative to its root (``("creative", "ascii-art")``). Alphabetical so first-wins
     collision handling is deterministic.
+
+    A skill under a junction/symlink child of a root (``skills/antigravity_skills ->
+    D:\\WSL\\...``) RESOLVES outside every root even though it lives under a trusted dir, so the
+    resolved-path match alone drops it from the gateway pickers while ``skills_list`` still
+    shows it. Both spellings are matched: the resolved path first (unchanged behavior), then the
+    lexical path. ``rel_parts`` keeps the spelling that matched, so a junctioned skill groups
+    under its VISIBLE directory name (``("antigravity_skills", "architect")``). The loader's own
+    security warning (skills_tool._log_security_warnings) still fires for such a skill — it
+    warns, it does not block — so the pickers and the loader now agree.
     """
     from pathlib import Path
 
@@ -205,12 +214,15 @@ def _iter_gateway_skills(platform: str):
     except Exception:
         disabled = set()
     hub_dir = (SKILLS_DIR / ".hub").resolve()
-    roots = [SKILLS_DIR.resolve()]
+    # (resolved_root, lexical_root) pairs: a root that is itself a junction keeps BOTH
+    # spellings so a skill under it matches whichever one it was recorded with.
+    roots: list[tuple[Path, Path]] = [(SKILLS_DIR.resolve(), SKILLS_DIR)]
     for getter in (get_external_skills_dirs, get_project_skills_dirs):
         try:
             for d in getter():
                 try:
-                    roots.append(Path(d).resolve())
+                    lexical = Path(d)
+                    roots.append((lexical.resolve(), lexical))
                 except Exception:
                     continue
         except Exception:
@@ -221,13 +233,29 @@ def _iter_gateway_skills(platform: str):
         skill_path = info.get("skill_md_path", "")
         if not skill_path:
             continue
-        sp = Path(skill_path).resolve()
+        sp_lexical = Path(skill_path)
+        sp = sp_lexical.resolve()
         if sp.is_relative_to(hub_dir):
             continue
-        root = next((r for r in roots if sp.is_relative_to(r)), None)
-        if root is None or info.get("name", "") in disabled:
+        # Resolved match first (the pre-existing behavior, byte for byte), then lexical.
+        rel_base: Optional[Path] = None
+        rel_root: Optional[Path] = None
+        for resolved_root, _lexical_root in roots:
+            if sp.is_relative_to(resolved_root):
+                rel_base, rel_root = sp.parent, resolved_root
+                break
+        if rel_base is None:
+            for _resolved_root, lexical_root in roots:
+                if sp_lexical.is_relative_to(lexical_root):
+                    rel_base, rel_root = sp_lexical.parent, lexical_root
+                    break
+        if rel_root is None or info.get("name", "") in disabled:
             continue
-        yield cmd_key, info, sp.parent.relative_to(root).parts
+        try:
+            rel_parts = rel_base.relative_to(rel_root).parts
+        except ValueError:
+            continue
+        yield cmd_key, info, rel_parts
 
 
 def _collect_gateway_skill_entries(
